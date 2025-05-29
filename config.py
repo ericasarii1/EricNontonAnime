@@ -1,180 +1,66 @@
-import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, CallbackContext, CallbackQueryHandler
-import requests
-import asyncio
-from threading import Thread
-from pyrogram import Client
-from pyrogram.raw.functions.phone import GetGroupCall
-import subprocess
+import os
+import yt_dlp
+import httpx
+from bs4 import BeautifulSoup
+from pyrogram import Client, filters
+from pyrogram.types import Message
 
-logging.basicConfig(level=logging.INFO)
-
-# ==== Bagian anime bot kamu (tidak diubah) ====
-
-def search_anime(title):
-    query = '''
-    query ($search: String) {
-      Media(search: $search, type: ANIME) {
-        id
-        title {
-          romaji
-          english
-          native
-        }
-        description(asHtml: false)
-        episodes
-        status
-        genres
-        averageScore
-        siteUrl
-      }
-    }
-    '''
-    variables = {"search": title}
-    url = "https://graphql.anilist.co"
-    r = requests.post(url, json={'query': query, 'variables': variables})
-    if r.status_code == 200:
-        return r.json()["data"]["Media"]
-    return None
-
-def start(update: Update, context: CallbackContext):
-    update.message.reply_text("Halo! Ketik /anime <judul> untuk cari anime.")
-
-def anime_command(update: Update, context: CallbackContext):
-    if len(context.args) == 0:
-        update.message.reply_text("Masukkan judul anime setelah /anime, contoh:\n/anime Naruto")
-        return
-    title = " ".join(context.args)
-    anime = search_anime(title)
-    if anime:
-        msg = f"🎬 *{anime['title']['romaji']}* ({anime['title']['english']})\n\n"
-        msg += f"📖 {anime['description'][:500]}...\n\n"
-        msg += f"📺 Episodes: {anime['episodes']}\n"
-        msg += f"⭐ Score: {anime['averageScore']}\n"
-        msg += f"🎭 Genres: {', '.join(anime['genres'])}\n"
-        msg += f"🔗 [More info]({anime['siteUrl']})"
-        
-        buttons = []
-        if anime['episodes'] and anime['episodes'] > 0:
-            for ep in range(1, min(anime['episodes'], 6)):
-                buttons.append([InlineKeyboardButton(f"Episode {ep}", callback_data=f"ep|{anime['id']}|{ep}")])
-        reply_markup = InlineKeyboardMarkup(buttons)
-        
-        update.message.reply_text(msg, reply_markup=reply_markup, parse_mode="Markdown", disable_web_page_preview=True)
-    else:
-        update.message.reply_text("Anime tidak ditemukan.")
-
-def button_callback(update: Update, context: CallbackContext):
-    query = update.callback_query
-    query.answer()
-    data = query.data.split("|")
-    if data[0] == "ep":
-        anime_id, ep_num = data[1], data[2]
-        stream_link = f"https://youtube.com/watch?v=anime_episode_{anime_id}_{ep_num}"  # placeholder
-        query.edit_message_text(f"Streaming Episode {ep_num}:\n{stream_link}")
-
-# ==== Bagian userbot streaming ==== 
-
-# Isi dengan API_ID dan API_HASH akun Telegram userbot-mu
-API_ID = 1234567
+# Ganti ini dengan data bot kamu
+API_ID = 123456
 API_HASH = "your_api_hash"
-USERBOT_SESSION_NAME = "userbot_session"  # nama session pyrogram userbot
+BOT_TOKEN = "your_bot_token"
 
-# Variabel global kontrol streaming
-is_streaming = False
-stream_process = None
+app = Client("otakudesu_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-app = Client(USERBOT_SESSION_NAME, api_id=API_ID, api_hash=API_HASH)
+@app.on_message(filters.command("anime") & (filters.private | filters.group))
+async def search_otakudesu(_, message: Message):
+    if len(message.command) < 2:
+        return await message.reply("Contoh: `/anime jujutsu kaisen`", quote=True)
 
-async def join_and_stream(chat_id: int):
-    global is_streaming, stream_process
-    await app.start()
-    print("[Userbot] Started, mencoba join group call...")
+    query = " ".join(message.command[1:])
+    search_url = f"https://otakudesu.cloud/?s={query.replace(' ', '+')}"
+    await message.reply("🔍 Lagi nyari dulu ya...", quote=True)
 
     try:
-        # Dapatkan group call
-        group_call = await app.invoke(GetGroupCall(peer=await app.resolve_peer(chat_id)))
-        print(f"[Userbot] Group call found: {group_call}")
+        # Scrape hasil pencarian
+        async with httpx.AsyncClient() as client:
+            r = await client.get(search_url, follow_redirects=True)
+            soup = BeautifulSoup(r.text, "html.parser")
+            result = soup.select_one("div.venutama div.venutama a")
 
-        # Contoh streaming video file lokal 'sample.mp4' ke group call via ffmpeg
-        # Ini contoh sederhana, streaming ke Telegram voice chat perlu ffmpeg pipe ke userbot audio/video
-        # Setup ffmpeg command sesuai kebutuhan streaming voice+video
+            if not result:
+                return await message.reply("Anime gak ketemu 😔", quote=True)
 
-        # Contoh dummy: kita jalankan ffmpeg yang output-nya ke virtual device (ubah sesuai implementasi)
-        ffmpeg_command = [
-            "ffmpeg", "-re", "-i", "sample.mp4",
-            "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"
-        ]
+            anime_url = result['href']
 
-        print("[Userbot] Mulai streaming...")
-        stream_process = subprocess.Popen(ffmpeg_command)
-        is_streaming = True
+            # Masuk ke halaman anime dan ambil episode pertama (terbaru)
+            r = await client.get(anime_url)
+            soup = BeautifulSoup(r.text, "html.parser")
+            episode_link = soup.select_one(".episodelist ul li a")
 
-        # Tahan sampai streaming selesai atau dihentikan
-        while is_streaming:
-            await asyncio.sleep(1)
+            if not episode_link:
+                return await message.reply("Gagal ambil episode 😭", quote=True)
 
-        # Stop streaming
-        if stream_process:
-            stream_process.terminate()
-            stream_process = None
-            print("[Userbot] Streaming dihentikan.")
+            episode_url = episode_link['href']
+
+        await message.reply("📥 Download dulu ya bentar...", quote=True)
+
+        # Download video pakai yt-dlp
+        ydl_opts = {
+            'quiet': True,
+            'format': 'best[ext=mp4]/best',
+            'outtmpl': 'anime_temp.%(ext)s'
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(episode_url, download=True)
+            file_path = ydl.prepare_filename(info)
+
+        await message.reply_video(file_path, caption=f"Nih anime-nya: {query.title()} 🎬", quote=True)
+
+        os.remove(file_path)
 
     except Exception as e:
-        print(f"[Userbot] Error: {e}")
+        await message.reply(f"❌ Error: {str(e)}", quote=True)
 
-    await app.stop()
-    print("[Userbot] Userbot berhenti.")
-
-def start_stream_thread(chat_id):
-    asyncio.run(join_and_stream(chat_id))
-
-# ==== Command live streaming di bot utama ====
-
-def startstream_command(update: Update, context: CallbackContext):
-    global is_streaming
-
-    if is_streaming:
-        update.message.reply_text("Streaming sudah berjalan.")
-        return
-
-    chat_id = update.effective_chat.id
-    update.message.reply_text("Mencoba memulai live streaming di obrolan video grup...")
-
-    # Jalankan userbot streaming di thread terpisah
-    thread = Thread(target=start_stream_thread, args=(chat_id,))
-    thread.start()
-
-def stopstream_command(update: Update, context: CallbackContext):
-    global is_streaming, stream_process
-    if not is_streaming:
-        update.message.reply_text("Streaming belum berjalan.")
-        return
-
-    is_streaming = False
-    if stream_process:
-        stream_process.terminate()
-        stream_process = None
-
-    update.message.reply_text("Live streaming dihentikan.")
-
-# ==== Main bot setup ====
-
-def main():
-    updater = Updater("TOKEN_BOT")
-    dp = updater.dispatcher
-
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("anime", anime_command))
-    dp.add_handler(CallbackQueryHandler(button_callback))
-
-    # Tambah handler live streaming
-    dp.add_handler(CommandHandler("startstream", startstream_command))
-    dp.add_handler(CommandHandler("stopstream", stopstream_command))
-
-    updater.start_polling()
-    updater.idle()
-
-if __name__ == "__main__":
-    main()
+app.run()
